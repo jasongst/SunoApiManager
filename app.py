@@ -171,6 +171,7 @@ async def startup():
     gen_cfg = config.get("generation", {})
     dl_cfg = config.get("download", {})
     silence_cfg = config.get("silence_analysis", {})
+    captcha_cfg = config.get("captcha", {})
 
     defaults = {
         "download_dir": dl_cfg.get("directory") or os.getenv("DOWNLOAD_DIR", "./downloads"),
@@ -184,6 +185,8 @@ async def startup():
         "download_format": dl_cfg.get("format", os.getenv("DOWNLOAD_FORMAT", "mp3")),
         "batch_size": str(gen_cfg.get("batch_size", 5)),
         "batch_delay": str(gen_cfg.get("batch_delay", 30)),
+        # 2Captcha API key for automatic hCaptcha solving (empty = manual solve)
+        "twocaptcha_api_key": captcha_cfg.get("twocaptcha_api_key") or os.getenv("TWOCAPTCHA_API_KEY", ""),
     }
     for key, val in defaults.items():
         if db.get_setting(key) is None:
@@ -1191,6 +1194,21 @@ async def save_settings(request: Request):
     for key, value in data.items():
         db.set_setting(key, value)
     return JSONResponse({"message": "Settings saved"})
+
+
+@app.get("/api/poll-interval")
+async def api_poll_interval():
+    """Return the global auto-poll interval used by the frontend poll loop.
+
+    Read live from the `polling_interval` setting (seconds) and clamped to a
+    sane range so a bad value can't hammer Suno or disable polling entirely.
+    """
+    try:
+        seconds = int(db.get_setting("polling_interval", "10") or 10)
+    except (TypeError, ValueError):
+        seconds = 10
+    seconds = max(5, min(seconds, 300))
+    return JSONResponse({"interval_s": seconds, "interval_ms": seconds * 1000})
 
 
 @app.post("/api/test-connection")

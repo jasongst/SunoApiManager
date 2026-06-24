@@ -271,6 +271,28 @@
     // ─── Global Auto-Polling ──────────────────────────────────
     // Polls Suno for status updates on all pages (not just dashboard)
     var _pollTimer = null;
+    var _pollInterval = 15000; // ms — overridden by the polling_interval setting
+
+    // Load the configured poll interval (seconds → ms). Called on page load and
+    // after saving settings so a changed interval applies without a restart.
+    async function loadPollInterval() {
+        try {
+            var resp = await fetch('/api/poll-interval');
+            var data = await resp.json();
+            if (data && data.interval_ms) {
+                _pollInterval = data.interval_ms;
+            }
+        } catch (e) {}
+        return _pollInterval;
+    }
+
+    // Restart the poll timer with the current interval (no-op if not polling).
+    function restartGlobalPoll() {
+        if (_pollTimer) {
+            stopGlobalPoll();
+            startGlobalPoll();
+        }
+    }
 
     async function globalPoll() {
         try {
@@ -290,9 +312,8 @@
 
     function startGlobalPoll() {
         if (_pollTimer) return;
-        var interval = 15000; // 15 seconds
-        _pollTimer = setInterval(globalPoll, interval);
-        console.log('[Poll] Started (every ' + (interval/1000) + 's)');
+        _pollTimer = setInterval(globalPoll, _pollInterval);
+        console.log('[Poll] Started (every ' + (_pollInterval/1000) + 's)');
     }
 
     function stopGlobalPoll() {
@@ -310,8 +331,10 @@
         }
     });
 
-    // Check on page load if there are incomplete gens → start polling
+    // Check on page load if there are incomplete gens → start polling.
+    // Load the configured interval first so the timer uses it from the start.
     (async function() {
+        await loadPollInterval();
         try {
             var resp = await fetch('/api/poll-status', { method: 'POST' });
             var data = await resp.json();

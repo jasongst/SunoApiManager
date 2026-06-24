@@ -118,7 +118,21 @@
                     Checking...
                 </span>
             </div>
-            <p class="text-xs text-slate-500 mb-4">Suno may require CAPTCHA verification for song generation. If required, a browser window will open for you to solve the challenge.</p>
+            <p class="text-xs text-slate-500 mb-4">Suno may require CAPTCHA verification for song generation. Set a 2Captcha API key below to solve challenges automatically; otherwise a browser window opens for you to solve it manually.</p>
+
+            <!-- 2Captcha API key (automatic solving) -->
+            <div class="mb-4">
+                <label class="block text-sm text-slate-400 mb-1.5">2Captcha API Key <span class="text-slate-600">(optional)</span></label>
+                <div class="relative">
+                    <input id="twocaptcha_api_key" type="password" value="{{ settings.get('twocaptcha_api_key', '') }}" placeholder="Leave empty for manual solving"
+                           class="w-full bg-background-dark/50 border border-white/10 rounded-lg px-4 py-2.5 pr-10 text-sm text-white focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"/>
+                    <button type="button" onclick="toggle2Captcha()" class="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
+                        <span class="material-icons text-sm" id="twocaptcha-eye">visibility</span>
+                    </button>
+                </div>
+                <p class="text-xs text-slate-500 mt-1">When set, hCaptcha challenges are solved automatically via <a href="https://2captcha.com" target="_blank" class="text-primary hover:underline">2Captcha</a>. Falls back to manual solving if the key is empty or the service fails. Click <span class="text-slate-300">Save Settings</span> to apply.</p>
+            </div>
+
             <div class="flex gap-3">
                 <button id="captcha-check-btn" onclick="checkCaptcha()" class="px-4 py-2 text-sm font-medium text-slate-300 border border-slate-600 rounded-lg hover:bg-white/5 transition-colors flex items-center gap-2">
                     <span class="material-icons text-sm">refresh</span>
@@ -155,11 +169,12 @@
                         </div>
                     </div>
                     <div>
-                        <label class="block text-sm text-slate-400 mb-1.5">Polling Interval (ms)</label>
+                        <label class="block text-sm text-slate-400 mb-1.5">Polling Interval</label>
                         <div class="flex items-center">
-                            <input id="polling_interval" type="number" value="{{ settings.get('polling_interval', '10') }}" class="w-full bg-background-dark/50 border border-white/10 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"/>
+                            <input id="polling_interval" type="number" min="5" max="300" value="{{ settings.get('polling_interval', '10') }}" class="w-full bg-background-dark/50 border border-white/10 rounded-lg px-4 py-2.5 text-sm text-white focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"/>
                             <span class="text-xs text-slate-500 ml-2">sec</span>
                         </div>
+                        <p class="text-xs text-slate-500 mt-1">How often to auto-check generation status (5–300s).</p>
                     </div>
                 </div>
                 <div class="grid grid-cols-2 gap-4">
@@ -392,6 +407,18 @@
     loadModels();
 
     // ─── CAPTCHA ───
+    function toggle2Captcha() {
+        const input = document.getElementById('twocaptcha_api_key');
+        const icon = document.getElementById('twocaptcha-eye');
+        if (input.type === 'password') {
+            input.type = 'text';
+            icon.textContent = 'visibility_off';
+        } else {
+            input.type = 'password';
+            icon.textContent = 'visibility';
+        }
+    }
+
     async function checkCaptcha() {
         var badge = document.getElementById('captcha-badge');
         var solveBtn = document.getElementById('captcha-solve-btn');
@@ -470,6 +497,7 @@
             download_format: document.getElementById('download_format').value,
             silence_threshold: document.getElementById('silence_threshold').value,
             min_silence_length: document.getElementById('min_silence_length').value,
+            twocaptcha_api_key: document.getElementById('twocaptcha_api_key').value.trim(),
         };
         try {
             const resp = await fetch('/api/settings', {
@@ -479,6 +507,11 @@
             });
             const data = await resp.json();
             showToast('Settings saved!', 'success');
+            // Apply the poll interval live (defined in base.html) without a reload.
+            if (typeof loadPollInterval === 'function') {
+                await loadPollInterval();
+                if (typeof restartGlobalPoll === 'function') restartGlobalPoll();
+            }
         } catch (e) {
             showToast('Failed to save settings', 'error');
         }
