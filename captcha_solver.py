@@ -21,6 +21,8 @@ style flags (which are themselves detectable) and run from a persistent profile.
 import asyncio
 import logging
 import os
+import random
+import re
 import sys
 import threading
 import time
@@ -31,6 +33,19 @@ logger = logging.getLogger("suno-manager")
 # Persistent browser profile — keeps cookies / Cloudflare clearance between
 # solves, which both reduces challenge frequency and looks less bot-like.
 _PROFILE_DIR = os.path.join(os.getcwd(), ".patchright_profile")
+
+# Random prompts used to auto-trigger a generation (and thus the hCaptcha
+# challenge) without manual typing. Kept generic and innocuous.
+_RANDOM_PROMPTS = [
+    "a mellow lo-fi beat with soft piano and gentle rain",
+    "an upbeat indie pop song about a summer road trip",
+    "a calm acoustic guitar ballad at sunset",
+    "a dreamy synthwave track with warm retro vibes",
+    "a soulful jazz tune with smooth saxophone",
+    "an energetic electronic dance anthem",
+    "a folk song with warm vocals and a bright banjo",
+    "a cinematic orchestral piece full of hope",
+]
 
 
 class CaptchaSolver:
@@ -313,20 +328,42 @@ class CaptchaSolver:
             except Exception:
                 pass
 
-            logger.info(
-                "Browser is open. Please solve the CAPTCHA:\n"
-                "  1. Type something in the prompt box\n"
-                "  2. Click 'Create'\n"
-                "  3. Solve the hCaptcha challenge\n"
-                "  4. The token will be captured automatically\n"
-                "  (this one song will actually be generated in your account)"
-            )
+            # --- Automate the trigger: type a random prompt and click Create ---
+            random_prompt = random.choice(_RANDOM_PROMPTS)
+            if not await self._fill_prompt(page, random_prompt):
+                logger.warning(
+                    "Could not locate the prompt textarea — please type a prompt "
+                    "and click Create manually."
+                )
+            elif not await self._click_create(page):
+                logger.warning(
+                    "Could not click the Create button — please click it manually."
+                )
 
-            # Wait for the token (user solves CAPTCHA manually)
+            # --- Manual only if a captcha is actually demanded ---
+            # After clicking Create, watch for an hCaptcha challenge. If one
+            # appears, hand control to the user; otherwise the generate request
+            # fires on its own and we capture the token automatically.
+            captcha_needed = await self._wait_for_captcha_or_token(page, token_future)
+
+            if captcha_needed:
+                logger.info(
+                    "hCaptcha challenge detected — please solve it manually in the "
+                    "browser window. The token will be captured automatically once "
+                    "the challenge is completed."
+                )
+                timeout = 300  # 5 min for a human to solve
+            else:
+                logger.info(
+                    "No CAPTCHA challenge appeared — continuing automatically."
+                )
+                timeout = 30  # the generate request should fire on its own
+
+            # Wait for the token (manual solve, or automatic generate request)
             try:
-                token = await asyncio.wait_for(token_future, timeout=300)  # 5 min
+                token = await asyncio.wait_for(token_future, timeout=timeout)
             except asyncio.TimeoutError:
-                logger.error("CAPTCHA solve timed out after 5 minutes")
+                logger.error(f"CAPTCHA token capture timed out after {timeout}s")
                 token = None
 
             # Clean up
@@ -336,6 +373,103 @@ class CaptchaSolver:
                 pass
 
             return token
+
+    async def _fill_prompt(self, page, text: str) -> bool:
+        """Type ``text`` into the Suno prompt textarea.
+
+        The element's Emotion class names (``css-…``) are hashed and change on
+        every build, so we anchor on the stable ``maxlength="3000"`` attribute
+        of the prompt textarea, with a few generic fallbacks. Typing is done
+        character-by-character to look human to the anti-bot layer.
+
+        Returns True if the prompt was entered.
+        """
+        selectors = [
+            'textarea[maxlength="3000"]',
+            'textarea[placeholder]',
+            "textarea",
+            'div[contenteditable="true"]',
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                await loc.wait_for(state="visible", timeout=5000)
+                await loc.click()
+                try:
+                    await loc.fill("")  # clear any existing draft
+                except Exception:
+                    pass
+                await loc.press_sequentially(text, delay=30)
+                logger.info(f"Typed prompt into '{sel}': {text!r}")
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _click_create(self, page) -> bool:
+        """Click the 'Create' button. Returns True on success.
+
+        The label is localized depending on the account language ("Create" in
+        English, "Créer" in French), so we try the known exact labels first and
+        fall back to a fuzzy accessible-name match.
+        """
+        for label in ("Create", "Créer"):
+            try:
+                btn = page.get_by_role("button", name=label, exact=True)
+                await btn.wait_for(state="visible", timeout=5000)
+                await btn.click()
+                logger.info(f"Clicked the '{label}' button")
+                return True
+            except Exception:
+                continue
+        # Fallback: any button whose accessible name contains create/créer.
+        try:
+            btn = page.get_by_role("button", name=re.compile(r"cr[ée]", re.I))
+            await btn.first.click(timeout=3000)
+            logger.info("Clicked the create button (fuzzy match)")
+            return True
+        except Exception:
+            return False
+
+    async def _wait_for_captcha_or_token(
+        self, page, token_future: asyncio.Future, probe_timeout: float = 15
+    ) -> bool:
+        """Decide whether manual captcha solving is required.
+
+        Polls for up to ``probe_timeout`` seconds after clicking Create:
+        - if the generate request already fired its token → automatic (False);
+        - if a *visible, real-sized* hCaptcha challenge iframe shows up → manual
+          (True). A size check rules out the always-present 1×1 invisible
+          hCaptcha iframe used in passive mode.
+
+        If nothing is decisive within the window, we err on the side of waiting
+        for the user (manual) unless a token has already been captured.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + probe_timeout
+        # Both the checkbox and the challenge iframes carry "hCaptcha" in their
+        # title / a hcaptcha.com src; the bounding-box check below picks out the
+        # actual visible challenge popup.
+        captcha = page.locator(
+            'iframe[src*="hcaptcha.com"], iframe[title*="hCaptcha"]'
+        )
+        while loop.time() < deadline:
+            if token_future.done():
+                return False
+            try:
+                count = await captcha.count()
+                for i in range(count):
+                    frame = captcha.nth(i)
+                    if not await frame.is_visible():
+                        continue
+                    box = await frame.bounding_box()
+                    if box and box["width"] > 50 and box["height"] > 50:
+                        return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        return not token_future.done()
 
     def invalidate_token(self):
         """Mark the current token as invalid (e.g. after a 422 response)."""
