@@ -21,6 +21,8 @@ style flags (which are themselves detectable) and run from a persistent profile.
 import asyncio
 import logging
 import os
+import sys
+import threading
 import time
 from typing import Optional
 
@@ -127,6 +129,46 @@ class CaptchaSolver:
             self._solving = False
 
     async def _browser_solve(self) -> Optional[str]:
+        """Launch the Playwright solve, isolating it from uvicorn's event loop.
+
+        On Windows uvicorn installs a ``WindowsSelectorEventLoopPolicy``, and the
+        selector loop cannot spawn subprocesses — launching the browser raises
+        ``NotImplementedError`` from ``create_subprocess_exec``. We therefore run
+        the whole solve in a dedicated thread backed by a ``ProactorEventLoop``,
+        which supports subprocesses, and await that thread without blocking
+        uvicorn's loop. On non-Windows platforms the running loop is fine.
+        """
+        if sys.platform != "win32":
+            return await self._browser_solve_impl()
+
+        result: dict = {}
+
+        def runner():
+            # Explicitly build a Proactor loop: asyncio.new_event_loop() would
+            # honour uvicorn's selector policy and reintroduce the same bug.
+            loop = asyncio.ProactorEventLoop()
+            try:
+                asyncio.set_event_loop(loop)
+                result["token"] = loop.run_until_complete(self._browser_solve_impl())
+            except BaseException as e:  # propagate to the awaiting coroutine
+                result["error"] = e
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=runner, name="captcha-solver", daemon=True)
+        thread.start()
+        # Wait for the solver thread without freezing uvicorn's event loop
+        # (the user may take minutes to solve the challenge).
+        await asyncio.get_running_loop().run_in_executor(None, thread.join)
+
+        if "error" in result:
+            raise result["error"]
+        return result.get("token")
+
+    async def _browser_solve_impl(self) -> Optional[str]:
         """Open browser, navigate to suno.com/create, capture hCaptcha token."""
         try:
             from patchright.async_api import async_playwright  # type: ignore[import-not-found]
