@@ -228,37 +228,62 @@ class CaptchaSolver:
             # rather than leaving an extra empty tab behind.
             page = context.pages[0] if context.pages else await context.new_page()
 
-            # Intercept generate request to capture hCaptcha token
-            async def handle_route(route):
+            # Passively observe every outgoing request and harvest the hCaptcha
+            # token from whichever one carries it. We do NOT block/abort the
+            # request: Suno's web frontend keeps changing the generate endpoint,
+            # and a too-specific route filter (the old approach) silently matched
+            # nothing — so the token was never captured and the request went
+            # through anyway. Observing all requests is robust to endpoint
+            # changes; the cost is that the song used to trigger the challenge is
+            # actually generated in your account (expected).
+            def _looks_like_hcaptcha(value) -> bool:
+                # hCaptcha tokens are long strings prefixed with P0_/P1_/E0_/E1_.
+                return (
+                    isinstance(value, str)
+                    and len(value) > 20
+                    and value[:3] in ("P0_", "P1_", "E0_", "E1_")
+                )
+
+            def on_request(request):
+                if token_future.done() or request.method != "POST":
+                    return
                 try:
-                    request = route.request
-                    post_data = request.post_data_json
-                    if post_data and "token" in post_data and post_data["token"]:
-                        captured_token = post_data["token"]
-                        logger.info("hCaptcha token captured from generate request!")
+                    data = request.post_data_json
+                except Exception:
+                    return
+                if not isinstance(data, dict):
+                    return
 
-                        # Also refresh JWT from the browser's auth header
-                        auth_header = request.headers.get("authorization", "")
-                        if auth_header.startswith("Bearer "):
-                            new_jwt = auth_header[7:]
-                            if new_jwt and new_jwt != self.suno_client.token:
-                                self.suno_client.token = new_jwt
-                                self.suno_client._token_refreshed_at = (
-                                    asyncio.get_running_loop().time()
-                                )
-                                logger.info("JWT also refreshed from browser session")
+                # Prefer an explicit "token" field; otherwise scan all values for
+                # something that looks like an hCaptcha token.
+                token = data.get("token")
+                if not (isinstance(token, str) and len(token) > 20):
+                    token = next(
+                        (v for v in data.values() if _looks_like_hcaptcha(v)), None
+                    )
+                if not token:
+                    return
 
-                        if not token_future.done():
-                            token_future.set_result(captured_token)
-                    # Abort the actual generate request (we just needed the token)
-                    await route.abort()
-                except Exception as e:
-                    logger.error(f"Route handler error: {e}")
-                    if not token_future.done():
-                        token_future.set_exception(e)
-                    await route.abort()
+                logger.info(f"hCaptcha token captured from {request.url}")
 
-            await page.route("**/api/generate/v2/**", handle_route)
+                # Also refresh JWT from the browser's auth header if present.
+                try:
+                    auth_header = request.headers.get("authorization", "")
+                except Exception:
+                    auth_header = ""
+                if auth_header.startswith("Bearer "):
+                    new_jwt = auth_header[7:]
+                    if new_jwt and new_jwt != self.suno_client.token:
+                        self.suno_client.token = new_jwt
+                        self.suno_client._token_refreshed_at = (
+                            asyncio.get_running_loop().time()
+                        )
+                        logger.info("JWT also refreshed from browser session")
+
+                if not token_future.done():
+                    token_future.set_result(token)
+
+            page.on("request", on_request)
 
             # Navigate to suno.com/create
             logger.info("Navigating to suno.com/create...")
@@ -293,7 +318,8 @@ class CaptchaSolver:
                 "  1. Type something in the prompt box\n"
                 "  2. Click 'Create'\n"
                 "  3. Solve the hCaptcha challenge\n"
-                "  4. The token will be captured automatically"
+                "  4. The token will be captured automatically\n"
+                "  (this one song will actually be generated in your account)"
             )
 
             # Wait for the token (user solves CAPTCHA manually)

@@ -247,25 +247,40 @@ class SunoClient:
         return "token" in body or "captcha" in body
 
     async def _generate_with_captcha(self, payload: dict, label: str) -> dict:
-        """POST a generate payload, transparently handling CAPTCHA tokens.
+        """POST a generate payload, transparently recovering from common rejects.
 
-        Injects a fresh-or-cached token, and if Suno rejects it (single-use /
-        expired token → 422), invalidates it, re-solves once, and retries.
+        - CAPTCHA token rejected (single-use / expired → 422): invalidate,
+          re-solve once, and retry.
+        - Negative tags not allowed on the account's plan (403
+          permission_denied): drop them and retry, so the rest of the request
+          still succeeds.
         """
         payload["token"] = await self._get_captcha_token()
-        try:
-            return await self._request(
-                "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
-            )
-        except Exception as e:
-            if not self._is_captcha_rejection(e):
+        captcha_retried = False
+        while True:
+            try:
+                return await self._request(
+                    "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
+                )
+            except SunoAPIError as e:
+                if self._is_captcha_rejection(e) and not captcha_retried:
+                    logger.warning(f"{label} 422 — CAPTCHA token invalid, re-solving...")
+                    self.captcha_solver.invalidate_token()
+                    payload["token"] = await self.captcha_solver.get_token(force=True)
+                    captcha_retried = True
+                    continue
+                if (
+                    e.status == 403
+                    and "negative" in e.body.lower()
+                    and payload.get("negative_tags")
+                ):
+                    logger.warning(
+                        f"{label}: your Suno plan doesn't allow negative tags — "
+                        "retrying without them"
+                    )
+                    payload["negative_tags"] = ""
+                    continue
                 raise
-            logger.warning(f"{label} 422 — CAPTCHA token invalid, re-solving...")
-            self.captcha_solver.invalidate_token()
-            payload["token"] = await self.captcha_solver.get_token(force=True)
-            return await self._request(
-                "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
-            )
 
     # ─── Core HTTP Request ───────────────────────────────────
 
