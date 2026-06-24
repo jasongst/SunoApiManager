@@ -1,5 +1,5 @@
 """
-CAPTCHA Solver for Suno — Handles hCaptcha challenges using Playwright.
+CAPTCHA Solver for Suno — Handles hCaptcha challenges using Patchright.
 
 When Suno requires CAPTCHA verification for generation, this module:
 1. Checks if CAPTCHA is required via /api/c/check
@@ -8,14 +8,27 @@ When Suno requires CAPTCHA verification for generation, this module:
 4. Returns the token for use in API calls
 
 The token is cached and reused until it expires or a new CAPTCHA is required.
+
+We use Patchright (a drop-in, undetected fork of Playwright) instead of vanilla
+Playwright: it patches the well-known automation leaks (Runtime.enable,
+navigator.webdriver, console hooks, …) at the CDP level. This makes Suno's
+hCaptcha / Cloudflare anti-bot present *easier* challenges to the human solver
+and reduces the risk of the session being flagged. Per Patchright's guidance we
+therefore do NOT pass the old `--disable-blink-features=AutomationControlled`
+style flags (which are themselves detectable) and run from a persistent profile.
 """
 
 import asyncio
 import logging
+import os
 import time
 from typing import Optional
 
 logger = logging.getLogger("suno-manager")
+
+# Persistent browser profile — keeps cookies / Cloudflare clearance between
+# solves, which both reduces challenge frequency and looks less bot-like.
+_PROFILE_DIR = os.path.join(os.getcwd(), ".patchright_profile")
 
 
 class CaptchaSolver:
@@ -32,7 +45,9 @@ class CaptchaSolver:
         self._token_time: float = 0
         self._token_ttl: float = 120  # hCaptcha tokens typically valid ~2 min
         self._solving: bool = False
-        self._solve_event: Optional[asyncio.Event] = None
+        # Serializes solves so concurrent generate calls never open two browser
+        # windows — they queue on the lock and reuse the freshly solved token.
+        self._lock = asyncio.Lock()
 
     @property
     def is_solving(self) -> bool:
@@ -82,20 +97,22 @@ class CaptchaSolver:
                 self._cached_token = None
                 return None
 
-        # If another solve is in progress, wait for it
-        if self._solving and self._solve_event:
-            logger.info("CAPTCHA solve already in progress, waiting...")
-            await self._solve_event.wait()
-            return self._cached_token
-
-        # Solve CAPTCHA
-        return await self._solve_captcha()
+        # Only one solve at a time. Concurrent callers queue here; the lock also
+        # means a second caller that was waiting will find a fresh token below.
+        async with self._lock:
+            # Re-check under the lock: another coroutine may have just solved it
+            # while we were waiting to acquire the lock.
+            if not force and self.has_valid_token:
+                logger.info("Reusing CAPTCHA token solved by a concurrent request")
+                return self._cached_token
+            return await self._solve_captcha()
 
     async def _solve_captcha(self) -> Optional[str]:
-        """Launch browser and let user solve hCaptcha manually."""
-        self._solving = True
-        self._solve_event = asyncio.Event()
+        """Launch browser and let user solve hCaptcha manually.
 
+        Must be called while holding ``self._lock``.
+        """
+        self._solving = True
         try:
             token = await self._browser_solve()
             if token:
@@ -108,42 +125,40 @@ class CaptchaSolver:
             raise
         finally:
             self._solving = False
-            if self._solve_event:
-                self._solve_event.set()
 
     async def _browser_solve(self) -> Optional[str]:
         """Open browser, navigate to suno.com/create, capture hCaptcha token."""
         try:
-            from playwright.async_api import async_playwright  # type: ignore[import-not-found]
+            from patchright.async_api import async_playwright  # type: ignore[import-not-found]
         except ImportError:
             raise RuntimeError(
-                "Playwright not installed. Run: pip install playwright && playwright install chromium"
+                "Patchright not installed. Run: pip install patchright && patchright install chromium"
             )
 
         logger.info("Launching browser for CAPTCHA solving...")
 
         token_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        os.makedirs(_PROFILE_DIR, exist_ok=True)
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
+            # Patchright recommends a persistent context with no custom args and
+            # no forced viewport — adding stealth flags or a fixed viewport is
+            # itself detectable. The patches that defeat hCaptcha/Cloudflare
+            # automation detection are applied automatically by Patchright.
+            # `channel="chrome"` (real Chrome) gives the best stealth; we fall
+            # back to the bundled Chromium if Chrome isn't available locally.
+            launch_kwargs = dict(
+                user_data_dir=_PROFILE_DIR,
                 headless=False,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-infobars",
-                ],
+                no_viewport=True,
             )
-
-            context = await browser.new_context(
-                user_agent=self.suno_client._default_headers.get(
-                    "User-Agent",
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/130.0.0.0 Safari/537.36",
-                ),
-                viewport={"width": 1280, "height": 900},
-            )
+            try:
+                context = await p.chromium.launch_persistent_context(
+                    channel="chrome", **launch_kwargs
+                )
+            except Exception as e:
+                logger.info(f"System Chrome unavailable ({e}); using bundled Chromium")
+                context = await p.chromium.launch_persistent_context(**launch_kwargs)
 
             # Inject cookies
             cookies = []
@@ -167,7 +182,9 @@ class CaptchaSolver:
                 })
             await context.add_cookies(cookies)
 
-            page = await context.new_page()
+            # A persistent context already opens with one blank page — reuse it
+            # rather than leaving an extra empty tab behind.
+            page = context.pages[0] if context.pages else await context.new_page()
 
             # Intercept generate request to capture hCaptcha token
             async def handle_route(route):
@@ -246,7 +263,7 @@ class CaptchaSolver:
 
             # Clean up
             try:
-                await browser.close()
+                await context.close()
             except Exception:
                 pass
 

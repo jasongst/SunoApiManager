@@ -19,10 +19,11 @@ WORKDIR /app
 # ── Install Python dependencies ─────────────────────────────
 COPY requirements.txt .
 
-# Install all deps except playwright (heavy + optional)
+# Install all deps except patchright (heavy + needs a desktop browser, which
+# the headless container can't provide for manual CAPTCHA solving anyway).
 # Also install websockets for uvicorn WebSocket support
 RUN pip install --no-cache-dir \
-    $(grep -v '^playwright' requirements.txt | tr '\n' ' ') \
+    $(grep -vE '^(playwright|patchright)' requirements.txt | tr '\n' ' ') \
     websockets
 
 # ── Copy application code ───────────────────────────────────

@@ -9,7 +9,7 @@
      2. Create a conda environment "suno-manager" with Python 3.12
      3. Install ffmpeg (via conda-forge)
      4. Install Python dependencies from requirements.txt
-     5. Install Playwright + Chromium (for CAPTCHA solving)
+     5. Install Patchright + Chromium (for CAPTCHA solving)
      6. Create a default config.yaml if missing
      7. Create required directories (downloads, uploads, logs)
 
@@ -169,15 +169,15 @@ else {
     exit 1
 }
 
-# ── Step 5: Install Playwright (optional, for CAPTCHA) ────────
-Write-Info "Installing Playwright + Chromium (for CAPTCHA solving) ..."
-Invoke-InEnv pip install playwright -q
-Invoke-InEnv python -m playwright install chromium
+# ── Step 5: Install Patchright (optional, for CAPTCHA) ────────
+Write-Info "Installing Patchright + Chromium (for CAPTCHA solving) ..."
+Invoke-InEnv pip install patchright -q
+Invoke-InEnv python -m patchright install chromium
 if ($LASTEXITCODE -ne 0) {
-    Write-Warn "Playwright Chromium install failed (non-critical - only needed for CAPTCHA)"
+    Write-Warn "Patchright Chromium install failed (non-critical - only needed for CAPTCHA)"
 }
 else {
-    Write-Ok "Playwright installed"
+    Write-Ok "Patchright installed"
 }
 
 # ── Step 6: Create Default Config ─────────────────────────────

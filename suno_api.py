@@ -22,6 +22,21 @@ import aiohttp
 
 logger = logging.getLogger("suno-manager")
 
+
+class SunoAPIError(Exception):
+    """Raised on a non-success response from the Suno API.
+
+    Carries the HTTP ``status`` code and response ``body`` so callers can react
+    to specific conditions (e.g. a 422 CAPTCHA-token rejection) by inspecting
+    the status code rather than parsing the stringified message.
+    """
+
+    def __init__(self, status: int, body: str = ""):
+        self.status = status
+        self.body = body
+        super().__init__(f"Suno API error ({status}): {body[:300]}")
+
+
 # ─── User Agent Pool (macOS Chrome) ─────────────────────────
 _USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -217,6 +232,41 @@ class SunoClient:
         """Get a CAPTCHA token if required, using cached token or solving new one."""
         return await self.captcha_solver.get_token()
 
+    @staticmethod
+    def _is_captcha_rejection(e: Exception) -> bool:
+        """True if an error is Suno rejecting the hCaptcha token (422).
+
+        hCaptcha tokens are often single-use, so a cached token can be rejected
+        on a later generation even though it was valid before. We detect this on
+        the real HTTP status code (422) plus a token/captcha hint in the body,
+        rather than substring-matching a stringified exception message.
+        """
+        if not isinstance(e, SunoAPIError) or e.status != 422:
+            return False
+        body = e.body.lower()
+        return "token" in body or "captcha" in body
+
+    async def _generate_with_captcha(self, payload: dict, label: str) -> dict:
+        """POST a generate payload, transparently handling CAPTCHA tokens.
+
+        Injects a fresh-or-cached token, and if Suno rejects it (single-use /
+        expired token → 422), invalidates it, re-solves once, and retries.
+        """
+        payload["token"] = await self._get_captcha_token()
+        try:
+            return await self._request(
+                "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
+            )
+        except Exception as e:
+            if not self._is_captcha_rejection(e):
+                raise
+            logger.warning(f"{label} 422 — CAPTCHA token invalid, re-solving...")
+            self.captcha_solver.invalidate_token()
+            payload["token"] = await self.captcha_solver.get_token(force=True)
+            return await self._request(
+                "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
+            )
+
     # ─── Core HTTP Request ───────────────────────────────────
 
     async def _request(
@@ -286,7 +336,7 @@ class SunoClient:
             if resp.status not in (200, 201):
                 text = await resp.text()
                 logger.error(f"Suno API error ({resp.status}) {method} {path}: {text[:300]}")
-                raise Exception(f"Suno API error ({resp.status}): {text[:300]}")
+                raise SunoAPIError(resp.status, text)
 
             return await resp.json()
 
@@ -302,31 +352,15 @@ class SunoClient:
 
         POST https://studio-api.prod.suno.com/api/generate/v2/
         """
-        captcha_token = await self._get_captcha_token()
         payload = {
             "gpt_description_prompt": prompt,
             "prompt": "",
             "generation_type": "TEXT",
             "make_instrumental": make_instrumental,
             "mv": model,
-            "token": captcha_token,
         }
         logger.info(f"generate: prompt='{prompt[:60]}...', model={model}")
-        try:
-            data = await self._request(
-                "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
-            )
-        except Exception as e:
-            if "422" in str(e) and "token" in str(e).lower():
-                logger.warning("Generate 422 — CAPTCHA token invalid, re-solving...")
-                self.captcha_solver.invalidate_token()
-                captcha_token = await self.captcha_solver.get_token(force=True)
-                payload["token"] = captcha_token
-                data = await self._request(
-                    "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
-                )
-            else:
-                raise
+        data = await self._generate_with_captcha(payload, "Generate")
         clips = data.get("clips", [])
         return [self._map_audio_info(c) for c in clips]
 
@@ -343,7 +377,6 @@ class SunoClient:
 
         POST https://studio-api.prod.suno.com/api/generate/v2/
         """
-        captcha_token = await self._get_captcha_token()
         payload = {
             "prompt": prompt,
             "tags": tags,
@@ -352,24 +385,9 @@ class SunoClient:
             "generation_type": "TEXT",
             "make_instrumental": make_instrumental,
             "mv": model,
-            "token": captcha_token,
         }
         logger.info(f"custom_generate: title='{title}', model={model}, tags='{tags[:50]}'")
-        try:
-            data = await self._request(
-                "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
-            )
-        except Exception as e:
-            if "422" in str(e) and "token" in str(e).lower():
-                logger.warning("Generate 422 — CAPTCHA token invalid, re-solving...")
-                self.captcha_solver.invalidate_token()
-                captcha_token = await self.captcha_solver.get_token(force=True)
-                payload["token"] = captcha_token
-                data = await self._request(
-                    "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
-                )
-            else:
-                raise
+        data = await self._generate_with_captcha(payload, "Custom generate")
         clips = data.get("clips", [])
         result = [self._map_audio_info(c) for c in clips]
         logger.info(f"custom_generate success: {len(result)} clips, ids={[r['id'] for r in result]}")
@@ -389,7 +407,6 @@ class SunoClient:
 
         POST https://studio-api.prod.suno.com/api/generate/v2/
         """
-        captcha_token = await self._get_captcha_token()
         payload = {
             "prompt": prompt,
             "tags": tags,
@@ -401,24 +418,9 @@ class SunoClient:
             "continue_clip_id": audio_id,
             "continue_at": continue_at,
             "task": "extend",
-            "token": captcha_token,
         }
         logger.info(f"extend_audio: clip={audio_id[:8]}, continue_at={continue_at}")
-        try:
-            data = await self._request(
-                "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
-            )
-        except Exception as e:
-            if "422" in str(e) and "token" in str(e).lower():
-                logger.warning("Extend 422 — CAPTCHA token invalid, re-solving...")
-                self.captcha_solver.invalidate_token()
-                captcha_token = await self.captcha_solver.get_token(force=True)
-                payload["token"] = captcha_token
-                data = await self._request(
-                    "POST", "/api/generate/v2/", json=payload, timeout=30, retry_auth=False
-                )
-            else:
-                raise
+        data = await self._generate_with_captcha(payload, "Extend")
         clips = data.get("clips", [])
         return [self._map_audio_info(c) for c in clips]
 
