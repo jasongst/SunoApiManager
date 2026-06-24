@@ -38,7 +38,7 @@ Bulk music generation management tool powered by the Suno API. Upload songs from
 - Waveform visualizer with silence region highlighting
 - Real-time progress tracking via WebSocket
 - **Suno History browser** — browse your entire Suno library with pagination, detail panels, mini audio player with seek, and batch download
-- **CAPTCHA solver** — automatic detection and browser-based solving
+- **CAPTCHA solver** — automatic hCaptcha solving via 2Captcha (optional API key), with manual browser-based solving as fallback
 - **Cookie helper** — step-by-step guide with animated demo in Settings
 - Swagger UI (`/docs`) with all Suno API endpoints
 - Dynamic model list (automatically loaded from your Suno account)
