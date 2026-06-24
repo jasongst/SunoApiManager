@@ -23,7 +23,7 @@ import openpyxl
 import yaml
 
 import database as db
-from suno_api import get_client, reset_client
+from suno_api import get_client, reset_client, close_client
 import audio_analyzer
 
 load_dotenv()
@@ -190,6 +190,13 @@ async def startup():
             db.set_setting(key, val)
 
     logger.info("Suno Manager started (direct API mode)")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Close the shared SunoClient so its aiohttp session is released cleanly."""
+    await close_client()
+    logger.info("Suno Manager shut down (client session closed)")
 
 
 # ─── Jinja2 Filters ──────────────────────────────────────────

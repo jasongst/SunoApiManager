@@ -703,6 +703,7 @@ def _parse_lyrics(text: str | None) -> str | None:
 # Managed by suno_router.py — initialized once at startup
 
 _client: SunoClient | None = None
+_client_lock = asyncio.Lock()
 
 
 async def get_client() -> SunoClient:
@@ -715,17 +716,35 @@ async def get_client() -> SunoClient:
     if _client is not None and _client._initialized:
         return _client
 
-    # Read cookie from config or env
-    cookie = _load_cookie()
-    if not cookie:
-        raise Exception(
-            "SUNO_COOKIE not configured. Set it in config.yaml (suno_api.cookie) "
-            "or as SUNO_COOKIE environment variable."
-        )
+    # Serialize concurrent initialization so racing requests don't each
+    # create a half-initialized client (leaking aiohttp sessions and
+    # raising "not initialized" mid-flight).
+    async with _client_lock:
+        # Re-check: another coroutine may have finished init while we waited.
+        if _client is not None and _client._initialized:
+            return _client
 
-    _client = SunoClient(cookie)
-    await _client.init()
-    return _client
+        # Read cookie from config or env
+        cookie = _load_cookie()
+        if not cookie:
+            raise Exception(
+                "SUNO_COOKIE not configured. Set it in config.yaml (suno_api.cookie) "
+                "or as SUNO_COOKIE environment variable."
+            )
+
+        client = SunoClient(cookie)
+        await client.init()
+        # Only publish the global once init() has completed.
+        _client = client
+        return _client
+
+
+async def close_client():
+    """Close the global client's HTTP session (call on app shutdown)."""
+    global _client
+    if _client is not None:
+        await _client.close()
+        _client = None
 
 
 def reset_client():
