@@ -210,3 +210,6 @@ config.yaml
 downloads/
 uploads/
 logs/
+
+# Patchright persistent browser profile
+.patchright_profile/
