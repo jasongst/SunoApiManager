@@ -4,6 +4,8 @@ Bulk music generation manager using Suno API.
 """
 
 import os
+import io
+import csv
 import json
 import asyncio
 import re
@@ -313,23 +315,39 @@ async def upload_excel(file: UploadFile = File(...)):
     with open(tmp_path, "wb") as f:
         f.write(contents)
 
+    def parse_row(i, row):
+        if not row or not row[0]:  # skip empty rows
+            return None
+        return {
+            "row_num": i + 1,
+            "title": str(row[0] or "").strip(),
+            "lyrics": str(row[1] or "").strip() if len(row) > 1 else "",
+            "tags": str(row[2] or "").strip() if len(row) > 2 else "",
+            "negative_tags": str(row[3] or "").strip() if len(row) > 3 else "",
+            "make_instrumental": str(row[4] or "").strip().lower() in ("true", "1", "yes") if len(row) > 4 else False,
+            "model": str(row[5] or "").strip() if len(row) > 5 and row[5] else "",
+        }
+
     try:
-        wb = openpyxl.load_workbook(tmp_path, read_only=True)
-        ws = wb.active
         rows = []
-        for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True)):
-            if not row[0]:  # skip empty rows
-                continue
-            rows.append({
-                "row_num": i + 1,
-                "title": str(row[0] or "").strip(),
-                "lyrics": str(row[1] or "").strip(),
-                "tags": str(row[2] or "").strip(),
-                "negative_tags": str(row[3] or "").strip() if len(row) > 3 else "",
-                "make_instrumental": str(row[4] or "").strip().lower() in ("true", "1", "yes") if len(row) > 4 else False,
-                "model": str(row[5] or "").strip() if len(row) > 5 and row[5] else "",
-            })
-        wb.close()
+        if file.filename.lower().endswith(".csv"):
+            # openpyxl cannot read CSV files, parse them with the csv module.
+            text = contents.decode("utf-8-sig", errors="replace")
+            reader = csv.reader(io.StringIO(text))
+            for i, row in enumerate(reader):
+                if i == 0:  # skip header row
+                    continue
+                parsed = parse_row(i, row)
+                if parsed:
+                    rows.append(parsed)
+        else:
+            wb = openpyxl.load_workbook(tmp_path, read_only=True)
+            ws = wb.active
+            for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True)):
+                parsed = parse_row(i, row)
+                if parsed:
+                    rows.append(parsed)
+            wb.close()
         return JSONResponse({"songs": rows, "count": len(rows), "filename": file.filename})
     except Exception as e:
         return JSONResponse({"error": f"Failed to parse file: {str(e)}"}, status_code=400)
